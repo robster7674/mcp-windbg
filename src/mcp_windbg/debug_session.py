@@ -674,13 +674,16 @@ class DebuggerSession:
         if not _acp_is_multibyte() or not self._engine_is_local:
             return
         try:
-            fd, path = tempfile.mkstemp(prefix="mcp_windbg_", suffix=".ulog")
-            os.close(fd)
-            os.remove(path)  # cdb creates it; a pre-existing file would be appended to
+            # cdb creates the log itself, and appends to a file that already exists,
+            # so name it inside a fresh private directory: nobody else can plant a
+            # file at that path between choosing the name and cdb opening it.
+            log_dir = tempfile.mkdtemp(prefix="mcp_windbg_")
+            path = os.path.join(log_dir, "session.ulog")
+            self._log_path = path
             self._send_marked(f".logopen /u {path}", self.timeout)
             if not os.path.exists(path):
+                self._cleanup_log()
                 return
-            self._log_path = path
             self._log_offset = 0
             self._log_active = True
             # The log opens mid-command, so it starts with its banner and the
@@ -735,6 +738,10 @@ class DebuggerSession:
                 break
             except OSError:
                 time.sleep(0.05)
+        try:
+            os.rmdir(os.path.dirname(self._log_path))
+        except OSError:
+            pass
         self._log_path = None
 
     def _marker_landed(self) -> bool:

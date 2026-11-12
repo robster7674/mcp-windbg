@@ -1,6 +1,5 @@
 import os
 import functools
-import traceback
 import glob
 import winreg
 import logging
@@ -11,6 +10,13 @@ from contextlib import asynccontextmanager
 from .cdb_session import CDBSession
 from .debug_session import DEFAULT_WAIT_FOR_BREAK_TIMEOUT, DebuggerError
 from .kd_session import KDSession
+from .command_policy import (
+    CommandPolicyError,
+    check_command,
+    check_local_path,
+    check_symbols_path,
+)
+from .http_security import BearerTokenMiddleware, build_transport_security
 from .filter_script import FilterScript, load_filter_script
 from .prompts import load_prompt
 
@@ -68,7 +74,9 @@ _sessions: Dict[str, dict] = {}
 
 
 def _new_session_id(kind: str) -> str:
-    return f"{kind}-{uuid.uuid4().hex[:8]}"
+    # The full 128 random bits: over HTTP every client shares this registry, so
+    # a session id is the only thing keeping one client out of another's session.
+    return f"{kind}-{uuid.uuid4().hex}"
 
 
 def _register_session(session, kind: str, label: str) -> str:
@@ -298,12 +306,13 @@ async def serve(
     auto_dump_dir_symbols: bool = True,
     init_commands: Optional[List[str]] = None,
     kernel_init_commands: Optional[List[str]] = None,
+    restrict_commands: bool = False,
 ) -> None:
     """Run the WinDbg MCP server with stdio transport."""
     content_filter = load_filter_script(filter_script) if filter_script else None
     server = _create_server(
         cdb_path, kd_path, symbols_path, timeout, verbose, content_filter, "stdio",
-        auto_dump_dir_symbols, init_commands, kernel_init_commands,
+        auto_dump_dir_symbols, init_commands, kernel_init_commands, restrict_commands,
     )
 
     options = server.create_initialization_options()
@@ -326,41 +335,19 @@ async def serve_http(  # pragma: no cover - HTTP transport cannot flush coverage
     auto_dump_dir_symbols: bool = True,
     init_commands: Optional[List[str]] = None,
     kernel_init_commands: Optional[List[str]] = None,
+    restrict_commands: bool = False,
+    allowed_hosts: Optional[List[str]] = None,
+    auth_token: Optional[str] = None,
 ) -> None:
     """Run the WinDbg MCP server with Streamable HTTP transport."""
-    from starlette.applications import Starlette
-    from starlette.routing import Mount
-    from starlette.types import Receive, Scope, Send
     import uvicorn
 
     content_filter = load_filter_script(filter_script) if filter_script else None
     server = _create_server(
         cdb_path, kd_path, symbols_path, timeout, verbose, content_filter, "streamable-http",
-        auto_dump_dir_symbols, init_commands, kernel_init_commands,
+        auto_dump_dir_symbols, init_commands, kernel_init_commands, restrict_commands,
     )
-
-    # Create the session manager
-    session_manager = StreamableHTTPSessionManager(
-        app=server,
-        json_response=True,
-    )
-
-    # ASGI handler for streamable HTTP connections
-    async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
-        await session_manager.handle_request(scope, receive, send)
-
-    @asynccontextmanager
-    async def lifespan(app: Starlette):
-        async with session_manager.run():
-            yield
-
-    app = Starlette(
-        debug=verbose,
-        routes=[
-            Mount("/mcp", app=handle_streamable_http),
-        ],
-        lifespan=lifespan,
-    )
+    app = build_http_app(server, host, allowed_hosts, auth_token)
 
     logger.info(f"Starting MCP WinDbg server with streamable-http transport on {host}:{port}")
     print(f"MCP WinDbg server running on http://{host}:{port}")
@@ -369,6 +356,46 @@ async def serve_http(  # pragma: no cover - HTTP transport cannot flush coverage
     config = uvicorn.Config(app, host=host, port=port, log_level="info" if verbose else "warning")
     server_instance = uvicorn.Server(config)
     await server_instance.serve()
+
+
+def build_http_app(
+    server: Server,
+    host: str = "127.0.0.1",
+    allowed_hosts: Optional[List[str]] = None,
+    auth_token: Optional[str] = None,
+):
+    """The ASGI app for the streamable-http transport, with its request checks.
+
+    Host/Origin validation (DNS-rebinding protection) is always on; the bearer
+    token check wraps the endpoint when a token is configured. Starlette's debug
+    mode stays off, so an unexpected error never returns a stack trace.
+    """
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    from starlette.types import Receive, Scope, Send
+
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=True,
+        security_settings=build_transport_security(host, allowed_hosts),
+    )
+
+    async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
+        await session_manager.handle_request(scope, receive, send)
+
+    endpoint = handle_streamable_http
+    if auth_token:
+        endpoint = BearerTokenMiddleware(handle_streamable_http, auth_token)
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        async with session_manager.run():
+            yield
+
+    return Starlette(
+        routes=[Mount("/mcp", app=endpoint)],
+        lifespan=lifespan,
+    )
 
 
 def _create_server(
@@ -382,6 +409,7 @@ def _create_server(
     auto_dump_dir_symbols: bool = True,
     init_commands: Optional[List[str]] = None,
     kernel_init_commands: Optional[List[str]] = None,
+    restrict_commands: bool = False,
 ) -> Server:
     """Create and configure the MCP server with all tools and prompts.
 
@@ -400,6 +428,27 @@ def _create_server(
         if content_filter is None:
             return arguments
         return content_filter.process_input(tool_name, arguments, transport, call_id) or {}
+
+    def enforce_command_policy(tool_name: str, arguments: dict) -> None:
+        """Apply --restrict-commands to a call's arguments (after the input filter)."""
+        if not restrict_commands:
+            return
+
+        def text(key: str) -> Optional[str]:
+            value = arguments.get(key)
+            return value if isinstance(value, str) else None
+
+        try:
+            if tool_name in ("run_cdb_command", "run_kd_command") and text("command"):
+                check_command(text("command"))
+            if tool_name in ("open_cdb_dump", "open_kd_dump"):
+                check_local_path(text("dump_path"), "dump_path")
+            if tool_name == "list_dumps":
+                check_local_path(text("directory_path"), "directory_path")
+            if tool_name.startswith("open_"):
+                check_symbols_path(text("symbols_path"))
+        except CommandPolicyError as e:
+            raise MCPError(INVALID_PARAMS, str(e))
 
     def filter_tool_content(tool_name: str, content: list[TextContent], call_id: str) -> list[TextContent]:
         if content_filter is None:
@@ -525,6 +574,7 @@ def _create_server(
         try:
             call_id = uuid.uuid4().hex
             arguments = filter_tool_arguments(name, arguments, call_id)
+            enforce_command_policy(name, arguments)
 
             if name == "list_dumps":
                 return filter_tool_content(name, _handle_list_dumps(arguments), call_id)
@@ -586,8 +636,10 @@ def _create_server(
             # stack trace would repeat it (partial output included) a second time.
             raise MCPError(INTERNAL_ERROR, f"Error executing tool {name}: {e}")
         except Exception as e:
-            traceback_str = traceback.format_exc()
-            raise MCPError(INTERNAL_ERROR, f"Error executing tool {name}: {str(e)}\n{traceback_str}")
+            # The stack trace goes to the server log, not to the caller: it names
+            # source paths and internals, which a remote HTTP client has no need for.
+            logger.exception("Unexpected error executing tool %s", name)
+            raise MCPError(INTERNAL_ERROR, f"Error executing tool {name}: {e}")
 
     # -- Tool handlers --------------------------------------------------------
 
